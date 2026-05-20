@@ -15,16 +15,20 @@ import (
 const (
 	greenbootTimeout      = 2 * time.Minute
 	greenbootPollInterval = 1 * time.Second
+	bootcTimerUnitFile    = "/usr/lib/systemd/system/bootc-fetch-apply-updates.timer"
+	bootcTimerDetectShell = "test -f " + bootcTimerUnitFile + " && echo exists || " +
+		"(find /usr/lib/systemd -name 'bootc-fetch-apply-updates.timer' -quit 2>/dev/null | grep -q . && echo exists) || " +
+		"(systemctl list-unit-files 'bootc-fetch-apply-updates.timer' 2>/dev/null | grep -q '^bootc-fetch-apply-updates.timer' && echo exists) || echo not-exists"
 )
 
 // VMPool manages VMs across all test suites
 type VMPool struct {
-	vms             map[int]vm.TestVMInterface // Regular VMs with snapshots
-	freshVMs        map[int]vm.TestVMInterface // Fresh VMs without snapshots
-	mutex           sync.RWMutex
-	config          VMPoolConfig
-	sharedDiskOnce  sync.Once
-	sharedDiskError error
+	vms                   map[int]vm.TestVMInterface // Regular VMs with snapshots
+	freshVMs              map[int]vm.TestVMInterface // Fresh VMs without snapshots
+	mutex                 sync.RWMutex
+	config                VMPoolConfig
+	sharedBaseMu          sync.Mutex
+	sharedBaseFingerprint string
 }
 
 // VMPoolConfig holds configuration for the VM pool
@@ -129,6 +133,15 @@ func (p *VMPool) createVMForWorker(workerID int) (vm.TestVMInterface, error) {
 
 	fmt.Printf("🔄 [VMPool] Worker %d: Creating VM %s\n", workerID, vmName)
 
+	baseFingerprint, err := p.baseDiskFingerprint()
+	if err != nil {
+		return nil, fmt.Errorf("failed to fingerprint e2e base disk: %w", err)
+	}
+
+	if err := p.invalidateWorkerStorageIfBaseDiskChanged(workerID, baseFingerprint); err != nil {
+		return nil, err
+	}
+
 	// Create worker-specific temp directory
 	workerDir := filepath.Join(p.config.TempDir, fmt.Sprintf("flightctl-e2e-worker-%d", workerID))
 	if err := os.MkdirAll(workerDir, 0755); err != nil {
@@ -140,28 +153,9 @@ func (p *VMPool) createVMForWorker(workerID int) (vm.TestVMInterface, error) {
 		return nil, fmt.Errorf("failed to set permissions on worker directory: %w", err)
 	}
 
-	// Create a shared base disk in /tmp using sync.Once to prevent race conditions
-	// This saves massive disk space while working around libvirt session mode security restrictions
 	sharedBaseDisk := filepath.Join(p.config.TempDir, "shared-base-disk.qcow2")
-
-	// Use sync.Once to ensure the shared base disk is created exactly once
-	p.sharedDiskOnce.Do(func() {
-		fmt.Printf("🔄 [VMPool] Worker %d: Creating shared base disk at %s\n", workerID, sharedBaseDisk)
-		cmd := exec.Command("cp", "--sparse=always", p.config.BaseDiskPath, sharedBaseDisk) //nolint:gosec
-		if output, err := cmd.CombinedOutput(); err != nil {
-			p.sharedDiskError = fmt.Errorf("failed to create shared base disk: %w, output: %s", err, string(output))
-			return
-		}
-		if err := os.Chmod(sharedBaseDisk, 0644); err != nil {
-			p.sharedDiskError = fmt.Errorf("failed to set permissions on shared base disk: %w", err)
-			return
-		}
-		fmt.Printf("✅ [VMPool] Worker %d: Shared base disk created successfully\n", workerID)
-	})
-
-	// Check if there was an error during shared disk creation
-	if p.sharedDiskError != nil {
-		return nil, p.sharedDiskError
+	if err := p.ensureSharedBaseDisk(workerID, baseFingerprint, sharedBaseDisk); err != nil {
+		return nil, err
 	}
 
 	workerDiskPath := filepath.Join(workerDir, fmt.Sprintf("worker-%d-disk.qcow2", workerID))
@@ -210,14 +204,21 @@ func (p *VMPool) createVMForWorker(workerID int) (vm.TestVMInterface, error) {
 	}
 	fmt.Printf("✅ [VMPool] Worker %d: VM started and SSH ready\n", workerID)
 
-	// Take a snapshot of the running state (VM stayso running)
+	// Take a snapshot of the running state (VM stays running)
 	exists, err := newVM.HasSnapshot("pristine")
 	if err != nil {
 		return nil, fmt.Errorf("failed to check if VM has snapshot: %w", err)
 	}
 	if exists {
-		fmt.Printf("✅ [VMPool] Worker %d: Pristine snapshot already exists, skipping creation\n", workerID)
-		return newVM, nil
+		if err := verifyBootcTimerUnitPresent(newVM); err != nil {
+			fmt.Printf("⚠️  [VMPool] Worker %d: Stale pristine snapshot (%v) — recreating\n", workerID, err)
+			if delErr := newVM.DeleteSnapshot("pristine"); delErr != nil {
+				return nil, fmt.Errorf("failed to delete stale pristine snapshot: %w", delErr)
+			}
+		} else {
+			fmt.Printf("✅ [VMPool] Worker %d: Pristine snapshot already exists and bootc timer unit is present\n", workerID)
+			return newVM, nil
+		}
 	}
 
 	fmt.Printf("🔄 [VMPool] Worker %d: Creating pristine snapshot\n", workerID)
@@ -246,6 +247,12 @@ func (p *VMPool) createVMForWorker(workerID int) (vm.TestVMInterface, error) {
 	if err != nil {
 		return nil, fmt.Errorf("failed to rotate logs before taking pristine snapshot: %w", err)
 	}
+
+	if err := verifyBootcTimerUnitPresent(newVM); err != nil {
+		_ = newVM.ForceDelete()
+		return nil, fmt.Errorf("refusing to create pristine snapshot: %w (rebuild bin/output/qcow2/disk.qcow2 with bootc base image)", err)
+	}
+
 	if err := newVM.CreateSnapshot("pristine"); err != nil {
 		// Clean up on failure
 		_ = newVM.ForceDelete()
@@ -262,6 +269,102 @@ func (p *VMPool) createVMForWorker(workerID int) (vm.TestVMInterface, error) {
 	// will revert to the pristine snapshot and start the agent itself.
 	fmt.Printf("✅ [VMPool] Worker %d: VM setup completed, VM is running\n", workerID)
 	return newVM, nil
+}
+
+func (p *VMPool) baseDiskFingerprint() (string, error) {
+	st, err := os.Stat(p.config.BaseDiskPath)
+	if err != nil {
+		return "", err
+	}
+	return fmt.Sprintf("%d:%d", st.Size(), st.ModTime().UnixNano()), nil
+}
+
+func (p *VMPool) ensureSharedBaseDisk(workerID int, fingerprint, sharedBaseDisk string) error {
+	p.sharedBaseMu.Lock()
+	defer p.sharedBaseMu.Unlock()
+
+	if p.sharedBaseFingerprint == fingerprint {
+		if _, err := os.Stat(sharedBaseDisk); err == nil {
+			return nil
+		}
+	}
+
+	fmt.Printf("🔄 [VMPool] Worker %d: Creating shared base disk at %s\n", workerID, sharedBaseDisk)
+	cmd := exec.Command("cp", "--sparse=always", p.config.BaseDiskPath, sharedBaseDisk) //nolint:gosec
+	if output, err := cmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("failed to create shared base disk: %w, output: %s", err, string(output))
+	}
+	if err := os.Chmod(sharedBaseDisk, 0644); err != nil {
+		return fmt.Errorf("failed to set permissions on shared base disk: %w", err)
+	}
+	p.sharedBaseFingerprint = fingerprint
+	fmt.Printf("✅ [VMPool] Worker %d: Shared base disk created successfully\n", workerID)
+	return nil
+}
+
+// invalidateWorkerStorageIfBaseDiskChanged removes overlay disks, shared base copies, and
+// libvirt state when bin/output/qcow2/disk.qcow2 is rebuilt between Jenkins jobs.
+func (p *VMPool) invalidateWorkerStorageIfBaseDiskChanged(workerID int, fingerprint string) error {
+	workerDir := filepath.Join(p.config.TempDir, fmt.Sprintf("flightctl-e2e-worker-%d", workerID))
+	stampPath := filepath.Join(workerDir, "base-disk.fingerprint")
+
+	old, err := os.ReadFile(stampPath)
+	if err == nil && strings.TrimSpace(string(old)) == fingerprint {
+		return nil
+	}
+
+	fmt.Printf("🔄 [VMPool] Worker %d: E2E base disk changed — invalidating worker VM disks and snapshots\n", workerID)
+
+	vmName := fmt.Sprintf("flightctl-e2e-worker-%d", workerID)
+	workerDiskPath := filepath.Join(workerDir, fmt.Sprintf("worker-%d-disk.qcow2", workerID))
+	probeVM, err := vm.NewVM(vm.TestVM{
+		TestDir:       workerDir,
+		VMName:        vmName,
+		DiskImagePath: workerDiskPath,
+		VMUser:        "user",
+		SSHPassword:   "user",
+		SSHPort:       p.config.SSHPortBase + workerID,
+	})
+	if err == nil {
+		if exists, existsErr := probeVM.Exists(); existsErr == nil && exists {
+			_ = probeVM.DeleteSnapshot("pristine")
+			if delErr := probeVM.ForceDelete(); delErr != nil {
+				fmt.Printf("⚠️  [VMPool] Worker %d: Failed to delete existing libvirt domain: %v\n", workerID, delErr)
+			}
+		}
+	}
+
+	if err := os.RemoveAll(workerDir); err != nil {
+		return fmt.Errorf("failed to remove worker directory during invalidation: %w", err)
+	}
+	if err := os.MkdirAll(workerDir, 0755); err != nil {
+		return fmt.Errorf("failed to recreate worker directory: %w", err)
+	}
+	if err := os.WriteFile(stampPath, []byte(fingerprint), 0644); err != nil {
+		return fmt.Errorf("failed to write base disk fingerprint stamp: %w", err)
+	}
+
+	sharedBaseDisk := filepath.Join(p.config.TempDir, "shared-base-disk.qcow2")
+	if err := os.Remove(sharedBaseDisk); err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("failed to remove shared base disk: %w", err)
+	}
+
+	p.sharedBaseMu.Lock()
+	p.sharedBaseFingerprint = ""
+	p.sharedBaseMu.Unlock()
+
+	return nil
+}
+
+func verifyBootcTimerUnitPresent(testVM vm.TestVMInterface) error {
+	stdout, err := testVM.RunSSH([]string{"sh", "-c", bootcTimerDetectShell}, nil)
+	if err != nil {
+		return fmt.Errorf("failed to probe bootc timer unit on guest: %w", err)
+	}
+	if strings.TrimSpace(stdout.String()) != "exists" {
+		return fmt.Errorf("bootc timer unit not visible on guest at %s", bootcTimerUnitFile)
+	}
+	return nil
 }
 
 // waitForGreenbootHealthcheck polls greenboot-healthcheck.service until it

@@ -247,6 +247,15 @@ if ! test/scripts/e2e_startup.sh; then
 fi
 echo "✅ [Test Execution] Startup completed successfully"
 
+# Step 1b: Clean stale libvirt domains and /tmp worker disks from prior jobs on this host.
+# e2e_cleanup also runs after tests; running it here ensures rebuilt disk.qcow2 is not masked
+# by an old qcow overlay or pristine snapshot (see bootc-timer e2e).
+echo "🔄 [Test Execution] Step 1b: Running pre-test VM cleanup..."
+if ! test/scripts/e2e_cleanup.sh; then
+    echo "⚠️  [Test Execution] Pre-test VM cleanup failed, but continuing..."
+fi
+echo "✅ [Test Execution] Pre-test VM cleanup completed"
+
 # Step 2: Run the tests
 echo "🔄 [Test Execution] Step 2: Running tests..."
 TEST_EXIT_CODE=0
